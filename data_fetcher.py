@@ -1,8 +1,10 @@
 """
-数据采集层 - 东方财富 + 新浪财经 + 磁盘缓存
+数据采集层 - 多源容错：新浪财经（主）+ 东方财富（备）+ 磁盘缓存
 """
 import akshare as ak
 import pandas as pd
+import requests
+import json
 from datetime import datetime, timedelta
 import time
 import random
@@ -10,7 +12,7 @@ import os
 import hashlib
 import logging
 import warnings
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 from config import CFG
 from utils import safe_float
@@ -21,9 +23,34 @@ logger = logging.getLogger("data")
 CACHE_DIR = os.path.join(os.path.dirname(__file__), CFG.cache_dir)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# 通用请求 headers（模拟浏览器）
+_BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
 
 def _throttle():
     time.sleep(CFG.request_delay + random.uniform(0, 0.15))
+
+
+def _retry_request(url: str, params: dict = None, headers: dict = None,
+                   retries: int = 3, timeout: int = 10) -> Optional[requests.Response]:
+    """带重试的 HTTP GET"""
+    hdrs = headers or _BROWSER_HEADERS
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, headers=hdrs, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            logger.warning(f"HTTP {r.status_code} (attempt {attempt+1}/{retries})")
+        except Exception as e:
+            logger.warning(f"请求失败 (attempt {attempt+1}/{retries}): {e}")
+        if attempt < retries - 1:
+            time.sleep(1 * (attempt + 1))  # 指数退避
+    return None
 
 
 def _cache_path(prefix: str, key: str, date_str: str) -> str:
@@ -50,7 +77,7 @@ def _save_cache(path: str, df: pd.DataFrame):
 
 
 # ============================================================
-# 涨停池（东方财富）
+# 涨停池（东方财富 - 这个接口通常没问题）
 # ============================================================
 def get_limit_up_stocks(date_str: str) -> pd.DataFrame:
     """获取当日涨停股池"""
@@ -160,38 +187,96 @@ def get_stock_history(code: str, days: int = 250) -> pd.DataFrame:
 
 
 # ============================================================
-# 板块资金流（东方财富）
+# 板块资金流 - 新浪（主）+ 东方财富（备）
 # ============================================================
 def get_sector_flow() -> pd.DataFrame:
-    """获取行业板块资金流排名"""
+    """
+    获取行业板块资金流排名
+    优先用新浪API（稳定），失败回退东方财富
+    """
     cache = _load_cache(_cache_path("flow", "sector", "today"), max_age_hours=4)
     if cache is not None:
         logger.info("板块资金流缓存命中")
         return cache
+
+    # 方案A：新浪板块资金流
+    df = _get_sector_flow_sina()
+    if df is not None and not df.empty:
+        _save_cache(_cache_path("flow", "sector", "today"), df)
+        return df
+
+    # 方案B：东方财富（备用）
     try:
         df = ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="行业资金流")
         if df is not None and not df.empty:
             _save_cache(_cache_path("flow", "sector", "today"), df)
-            logger.info(f"板块资金流获取成功: {len(df)} 个板块")
+            logger.info(f"[备用] 东方财富板块资金流: {len(df)} 个板块")
             return df
     except Exception as e:
-        logger.warning(f"板块资金流获取失败: {e}")
+        logger.warning(f"东方财富板块资金流也失败: {e}")
+
     return pd.DataFrame()
 
 
+def _get_sector_flow_sina() -> Optional[pd.DataFrame]:
+    """新浪财经板块资金流（行业 + 概念合并）"""
+    url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_bkzj_bk"
+    all_sectors = []
+
+    for fenlei, label in [(1, "行业"), (0, "概念")]:
+        params = {"page": 1, "num": 100, "sort": "netamount", "asc": 0, "fenlei": fenlei}
+        r = _retry_request(url, params=params)
+        if r is None:
+            logger.warning(f"新浪{label}板块资金流获取失败")
+            continue
+        try:
+            data = json.loads(r.text)
+            for item in data:
+                all_sectors.append({
+                    "板块名称": item.get("name", ""),
+                    "板块类型": label,
+                    "主力净流入-净额": safe_float(item.get("netamount")),
+                    "主力净流入-净占比": safe_float(item.get("ratioamount")),
+                    "流入额": safe_float(item.get("inamount")),
+                    "流出额": safe_float(item.get("outamount")),
+                    "领涨股": item.get("ts_name", ""),
+                    "领涨涨幅": safe_float(item.get("ts_changeratio")) * 100,
+                    "换手率": safe_float(item.get("turnover")),
+                })
+        except Exception as e:
+            logger.warning(f"新浪{label}板块解析失败: {e}")
+
+    if all_sectors:
+        df = pd.DataFrame(all_sectors)
+        logger.info(f"新浪板块资金流获取成功: {len(df)} 个板块（行业+概念）")
+        return df
+    return None
+
+
 # ============================================================
-# 个股资金流（东方财富）
+# 个股资金流 - 新浪板块内个股（主）+ 东方财富（备）
 # ============================================================
 def get_individual_fund_flow() -> pd.DataFrame:
-    """获取个股主力资金流排名（实时）"""
+    """
+    获取个股主力资金流
+    方案A：新浪板块内个股资金流（按行业板块聚合）
+    方案B：东方财富（备用，可能被封）
+    """
     cache = _load_cache(_cache_path("flow", "individual", "today"), max_age_hours=2)
     if cache is not None:
         logger.info("个股资金流缓存命中")
         return cache
+
+    # 方案A：新浪
+    df = _get_individual_flow_sina()
+    if df is not None and not df.empty:
+        _save_cache(_cache_path("flow", "individual", "today"), df)
+        return df
+
+    # 方案B：东方财富
     try:
         df = ak.stock_individual_fund_flow_rank(indicator="今日")
         if df is not None and not df.empty:
-            # 统一列名
             col_map = {
                 "代码": "code", "名称": "name",
                 "主力净流入-净额": "main_net_inflow",
@@ -203,11 +288,49 @@ def get_individual_fund_flow() -> pd.DataFrame:
             }
             df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
             _save_cache(_cache_path("flow", "individual", "today"), df)
-            logger.info(f"个股资金流获取成功: {len(df)} 只")
+            logger.info(f"[备用] 东方财富个股资金流: {len(df)} 只")
             return df
     except Exception as e:
-        logger.warning(f"个股资金流获取失败（不影响核心筛选）: {e}")
+        logger.warning(f"东方财富个股资金流也失败: {e}")
+
     return pd.DataFrame()
+
+
+def _get_individual_flow_sina() -> Optional[pd.DataFrame]:
+    """
+    通过新浪板块资金流API，获取热门板块的领涨股资金数据
+    虽然不是全市场个股排名，但能覆盖涨停股所在板块的热门个股
+    """
+    url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_bkzj_bk"
+    params = {"page": 1, "num": 30, "sort": "netamount", "asc": 0, "fenlei": 1}
+    r = _retry_request(url, params=params)
+    if r is None:
+        return None
+
+    try:
+        data = json.loads(r.text)
+        records = []
+        for item in data:
+            ts_symbol = item.get("ts_symbol", "")
+            # 提取领涨股代码
+            code = ts_symbol.replace("sz", "").replace("sh", "")
+            records.append({
+                "code": code,
+                "name": item.get("ts_name", ""),
+                "sector": item.get("name", ""),
+                "sector_net_inflow": safe_float(item.get("netamount")),
+                "sector_inflow": safe_float(item.get("inamount")),
+                "sector_outflow": safe_float(item.get("outamount")),
+                "pct_chg": safe_float(item.get("ts_changeratio")) * 100,
+                "turnover": safe_float(item.get("turnover")),
+            })
+        if records:
+            df = pd.DataFrame(records)
+            logger.info(f"新浪个股资金流（板块领涨股）: {len(df)} 只")
+            return df
+    except Exception as e:
+        logger.warning(f"新浪个股资金流解析失败: {e}")
+    return None
 
 
 # ============================================================
@@ -223,14 +346,12 @@ def get_dragon_tiger_list(date_str: str) -> pd.DataFrame:
         logger.info(f"龙虎榜缓存命中: {len(cache)} 条")
         return cache
     try:
-        # 查当日龙虎榜（日期前后各1天以防数据延迟）
         dt = datetime.strptime(date_str, "%Y%m%d")
         start = (dt - timedelta(days=1)).strftime("%Y%m%d")
         end = dt.strftime("%Y%m%d")
         df = ak.stock_lhb_detail_em(start_date=start, end_date=end)
         if df is None or df.empty:
             return pd.DataFrame()
-        # 统一列名
         col_map = {
             "代码": "code", "名称": "name", "上榜日": "lhb_date",
             "收盘价": "close", "涨跌幅": "pct_chg",
@@ -314,7 +435,6 @@ def get_northbound_flow() -> pd.DataFrame:
             "所属板块": "sector",
         }
         df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-        # 确保 code 列是字符串
         df["code"] = df["code"].astype(str).str.zfill(6)
         _save_cache(_cache_path("north", "hold", "today"), df)
         logger.info(f"北向资金获取成功: {len(df)} 只")
