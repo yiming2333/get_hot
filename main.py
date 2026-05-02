@@ -100,7 +100,7 @@ def run_screen(date_str: str):
 
     # 涨停池概览
     print(f"\n📋 当日涨停池概览:")
-    from utils import safe_float
+    from utils import safe_float, safe_int
     for _, r in limit_up_df.head(20).iterrows():
         amt = safe_float(r.get("amount")) / 1e8
         print(f"    {r.get('code','')} {r.get('name',''):　<6} "
@@ -149,13 +149,6 @@ def run_screen(date_str: str):
     # 输出结果
     # ============================================================
     print_results(results)
-
-
-def safe_int(val, default=0):
-    try:
-        return int(val) if val is not None else default
-    except (ValueError, TypeError):
-        return default
 
 
 def main():

@@ -133,6 +133,9 @@ def _fetch_one_history(code: str, days: int = 250) -> tuple:
         )
         if df is None or df.empty:
             return (code, pd.DataFrame())
+        if "date" not in df.columns:
+            logger.warning(f"历史数据缺少 date 列 {code}，跳过")
+            return (code, pd.DataFrame())
         df = df.sort_values("date").reset_index(drop=True)
         if "pct_chg" not in df.columns and len(df) > 1:
             df["pct_chg"] = df["close"].astype(float).pct_change() * 100
@@ -143,7 +146,10 @@ def _fetch_one_history(code: str, days: int = 250) -> tuple:
 
 
 def batch_get_history(codes: list, days: int = 250, date_str: str = "") -> Dict[str, pd.DataFrame]:
-    """批量获取历史数据（串行 + 缓存）"""
+    """批量获取历史数据（并发 + 缓存）"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
     result: Dict[str, pd.DataFrame] = {}
     to_fetch = []
 
@@ -158,16 +164,31 @@ def batch_get_history(codes: list, days: int = 250, date_str: str = "") -> Dict[
         logger.info(f"历史数据全部缓存命中: {len(result)} 只")
         return result
 
-    logger.info(f"缓存命中 {len(result)}/{len(codes)}，需拉取 {len(to_fetch)} 只")
+    logger.info(f"缓存命中 {len(result)}/{len(codes)}，需拉取 {len(to_fetch)} 只（并发模式）")
 
     done = 0
-    for code in to_fetch:
-        done += 1
-        print(f"\r  拉取 [{done}/{len(to_fetch)}] {code}...", end="", flush=True)
+    done_lock = threading.Lock()
+
+    def _fetch_and_update(code: str):
+        nonlocal done
         _, df = _fetch_one_history(code, days)
+        with done_lock:
+            done += 1
+            status = f"✅ {len(df)}行" if not df.empty and len(df) > 20 else "❌ 无数据"
+            print(f"\r  拉取 [{done}/{len(to_fetch)}] {code} {status}", flush=True)
         if not df.empty and len(df) > 20:
-            result[code] = df
             _save_cache(_cache_path("hist", code, date_str or "latest"), df)
+            return (code, df)
+        return (code, pd.DataFrame())
+
+    # 并发数：4 线程，避免触发限流
+    max_workers = min(4, len(to_fetch))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fetch_and_update, c): c for c in to_fetch}
+        for future in as_completed(futures):
+            code, df = future.result()
+            if not df.empty:
+                result[code] = df
 
     print()
     logger.info(f"历史数据获取完成: {len(result)}/{len(codes)} 只")
