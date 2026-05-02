@@ -138,6 +138,7 @@ class SimpleBacktester:
 def run_backtest(start_date: str, end_date: str, hold_days: int = 3):
     """便捷入口：回测指定区间"""
     from config import CFG
+    from data_fetcher import get_limit_up_stocks
 
     bt = SimpleBacktester(
         hold_days=hold_days,
@@ -145,40 +146,56 @@ def run_backtest(start_date: str, end_date: str, hold_days: int = 3):
         take_profit=0.10
     )
 
-    # 简化版：获取区间内所有交易日的涨停数据并回测
-    # 实际使用时应配合 main.py 的完整筛选流程
     logger.info(f"回测区间: {start_date} ~ {end_date}, 持仓天数: {hold_days}")
     print(f"📊 回测区间: {start_date} ~ {end_date}")
     print(f"   持仓天数: {hold_days}  止损: {bt.stop_loss:.0%}  止盈: {bt.take_profit:.0%}")
     print()
 
-    # 生成日期序列（简化：只取月末交易日）
-    from data_fetcher import get_limit_up_stocks
     current = datetime.strptime(start_date, "%Y%m%d")
     end_dt = datetime.strptime(end_date, "%Y%m%d")
-    all_results = []
+
+    # ── 第一遍：收集所有交易日的涨停池，确定需要拉哪些股票 ──
+    print("  📋 扫描交易日 & 收集股票池...")
+    day_pools: Dict[str, pd.DataFrame] = {}
+    all_codes: set = set()
 
     while current <= end_dt:
         date_str = current.strftime("%Y%m%d")
-        # 跳过周末
         if current.weekday() < 5:
-            print(f"  📅 {date_str} ...", end="")
             pool = get_limit_up_stocks(date_str)
             if not pool.empty:
-                codes = pool["code"].tolist()
-                hist = batch_get_history(codes, days=30, date_str=date_str)
-                signals = pool.to_dict("records")
-                result = bt.run(signals, hist, date_str)
-                if result["total_signals"] > 0:
-                    all_results.append(result)
-                    print(f" {result['total_signals']}信号, "
-                          f"胜率{result['win_rate']:.0%}, "
-                          f"均收{result['avg_return']:.2%}")
-                else:
-                    print(" 无信号")
-            else:
-                print(" 非交易日")
+                day_pools[date_str] = pool
+                all_codes.update(pool["code"].tolist())
         current += timedelta(days=1)
+
+    trading_days = len(day_pools)
+    print(f"  ✅ {trading_days} 个交易日, 共 {len(all_codes)} 只不同股票")
+
+    if not day_pools:
+        print("\n⚠️  回测区间内无交易日数据")
+        return
+
+    # ── 第二遍：批量拉取所有股票的历史数据（只拉一次） ──
+    print(f"\n  📥 批量拉取 {len(all_codes)} 只股票历史数据（一次性, 快速模式）...")
+    history_cache = batch_get_history(list(all_codes), days=250,
+                                      date_str="backtest_pool", fast=True)
+    print(f"  ✅ 成功获取 {len(history_cache)}/{len(all_codes)} 只")
+
+    # ── 第三遍：逐日回测 ──
+    print(f"\n  🔄 开始逐日回测...")
+    all_results = []
+
+    for date_str, pool in sorted(day_pools.items()):
+        print(f"  📅 {date_str} ...", end="")
+        signals = pool.to_dict("records")
+        result = bt.run(signals, history_cache, date_str)
+        if result["total_signals"] > 0:
+            all_results.append(result)
+            print(f" {result['total_signals']}信号, "
+                  f"胜率{result['win_rate']:.0%}, "
+                  f"均收{result['avg_return']:.2%}")
+        else:
+            print(" 无信号")
 
     # 汇总
     if all_results:
@@ -198,6 +215,11 @@ def run_backtest(start_date: str, end_date: str, hold_days: int = 3):
             print(f"  平均收益:   {np.mean(all_returns):.2%}")
             print(f"  最大盈利:   {max(all_returns):.2%}")
             print(f"  最大亏损:   {min(all_returns):.2%}")
+            wins_arr = [r for r in all_returns if r > 0]
+            losses_arr = [r for r in all_returns if r <= 0]
+            avg_win = np.mean(wins_arr) if wins_arr else 0
+            avg_loss = abs(np.mean(losses_arr)) if losses_arr else 0.01
+            print(f"  盈亏比:     {avg_win / avg_loss:.2f}")
         print(f"{'='*60}")
     else:
         print("\n⚠️  回测区间内无有效信号")

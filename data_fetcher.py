@@ -145,16 +145,21 @@ def _fetch_one_history(code: str, days: int = 250) -> tuple:
         return (code, pd.DataFrame())
 
 
-def batch_get_history(codes: list, days: int = 250, date_str: str = "") -> Dict[str, pd.DataFrame]:
-    """批量获取历史数据（并发 + 缓存）"""
+def batch_get_history(codes: list, days: int = 250, date_str: str = "",
+                      fast: bool = False) -> Dict[str, pd.DataFrame]:
+    """批量获取历史数据（并发 + 缓存）
+    fast=True 时缩短 throttle、加大并发、延长缓存（适用于回测等批量场景）
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import threading
 
     result: Dict[str, pd.DataFrame] = {}
     to_fetch = []
+    cache_hours = 168 if fast else 12  # 回测缓存 7 天
 
     for code in codes:
-        cache = _load_cache(_cache_path("hist", code, date_str or "latest"), max_age_hours=12)
+        cache = _load_cache(_cache_path("hist", code, date_str or "latest"),
+                            max_age_hours=cache_hours)
         if cache is not None and len(cache) > 20:
             result[code] = cache
         else:
@@ -164,25 +169,48 @@ def batch_get_history(codes: list, days: int = 250, date_str: str = "") -> Dict[
         logger.info(f"历史数据全部缓存命中: {len(result)} 只")
         return result
 
-    logger.info(f"缓存命中 {len(result)}/{len(codes)}，需拉取 {len(to_fetch)} 只（并发模式）")
+    logger.info(f"缓存命中 {len(result)}/{len(codes)}，需拉取 {len(to_fetch)} 只（{'快速' if fast else '标准'}并发）")
 
     done = 0
     done_lock = threading.Lock()
+    delay = 0.12 if fast else CFG.request_delay
 
     def _fetch_and_update(code: str):
         nonlocal done
-        _, df = _fetch_one_history(code, days)
+        # 快速模式使用更短的 throttle
+        try:
+            sina_code = _code_to_sina(code)
+            end = datetime.now().strftime("%Y%m%d")
+            start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
+            time.sleep(delay + random.uniform(0, 0.08))
+            df = ak.stock_zh_a_daily(
+                symbol=sina_code, start_date=start, end_date=end, adjust="qfq"
+            )
+            if df is None or df.empty:
+                df_out = pd.DataFrame()
+            elif "date" not in df.columns:
+                logger.warning(f"历史数据缺少 date 列 {code}，跳过")
+                df_out = pd.DataFrame()
+            else:
+                df = df.sort_values("date").reset_index(drop=True)
+                if "pct_chg" not in df.columns and len(df) > 1:
+                    df["pct_chg"] = df["close"].astype(float).pct_change() * 100
+                df_out = df
+        except Exception as e:
+            logger.warning(f"历史数据获取失败 {code}: {e}")
+            df_out = pd.DataFrame()
+
         with done_lock:
             done += 1
-            status = f"✅ {len(df)}行" if not df.empty and len(df) > 20 else "❌ 无数据"
-            print(f"\r  拉取 [{done}/{len(to_fetch)}] {code} {status}", flush=True)
-        if not df.empty and len(df) > 20:
-            _save_cache(_cache_path("hist", code, date_str or "latest"), df)
-            return (code, df)
+            status = f"✅ {len(df_out)}行" if not df_out.empty and len(df_out) > 20 else "❌ 无数据"
+            if done % 50 == 0 or done == len(to_fetch):
+                print(f"\r  拉取 [{done}/{len(to_fetch)}] {code} {status}", flush=True)
+        if not df_out.empty and len(df_out) > 20:
+            _save_cache(_cache_path("hist", code, date_str or "latest"), df_out)
+            return (code, df_out)
         return (code, pd.DataFrame())
 
-    # 并发数：4 线程，避免触发限流
-    max_workers = min(4, len(to_fetch))
+    max_workers = min(8 if fast else 4, len(to_fetch))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_fetch_and_update, c): c for c in to_fetch}
         for future in as_completed(futures):
