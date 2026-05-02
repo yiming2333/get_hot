@@ -7,28 +7,14 @@ D5: 量价健康度
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from config import WEIGHTS, OUTPUT_TOP_N
+import logging
+from typing import Dict, Tuple
+
+from config import CFG, WEIGHTS, OUTPUT_TOP_N
 from data_fetcher import get_stock_history
-import warnings
-warnings.filterwarnings("ignore")
+from utils import parse_time, safe_float, safe_int
 
-
-def _parse_time(t_str: str):
-    """解析时间字符串，支持 092500 和 09:25:00 两种格式"""
-    t_str = str(t_str).strip()
-    if not t_str:
-        return None
-    if len(t_str) == 6 and t_str.isdigit():
-        try:
-            return datetime.strptime(t_str, "%H%M%S")
-        except:
-            pass
-    for fmt in ["%H:%M:%S", "%H:%M"]:
-        try:
-            return datetime.strptime(t_str, fmt)
-        except:
-            continue
-    return None
+logger = logging.getLogger("scorer")
 
 
 class FiveDimScorer:
@@ -72,15 +58,14 @@ class FiveDimScorer:
                 "d5_vol_health": self._score_vol_health(row, hist),
             }
 
-            total_score = sum(
-                scores[k] * WEIGHTS[{
-                    "d1_limit_premium": "limit_up_premium",
-                    "d2_capital": "capital_resonance",
-                    "d3_news": "news_catalyst",
-                    "d4_leader": "leader_status",
-                    "d5_vol_health": "vol_health",
-                }[k]] for k in scores
-            )
+            weight_map = {
+                "d1_limit_premium": "limit_up_premium",
+                "d2_capital": "capital_resonance",
+                "d3_news": "news_catalyst",
+                "d4_leader": "leader_status",
+                "d5_vol_health": "vol_health",
+            }
+            total_score = sum(scores[k] * WEIGHTS[weight_map[k]] for k in scores)
 
             entry = row.to_dict()
             entry.update(scores)
@@ -97,7 +82,7 @@ class FiveDimScorer:
     # ============================================================
     def _score_limit_premium(self, row, hist: pd.DataFrame) -> float:
         score = 50.0
-        ban_count = int(row.get("ban_count", 1) or 1)
+        ban_count = safe_int(row.get("ban_count"), 1)
         if ban_count >= 3:
             score += 25
         elif ban_count >= 2:
@@ -106,7 +91,7 @@ class FiveDimScorer:
             score += 5
 
         seal_time = str(row.get("seal_time", "") or row.get("first_seal_time", ""))
-        t = _parse_time(seal_time)
+        t = parse_time(seal_time)
         if t:
             minutes_from_open = (t.hour - 9) * 60 + t.minute - 30
             if minutes_from_open <= 5:
@@ -124,13 +109,13 @@ class FiveDimScorer:
     # ============================================================
     def _score_capital_resonance(self, row, code: str) -> float:
         score = 40.0
-        turnover = float(row.get("turnover", 0) or 0)
+        turnover = safe_float(row.get("turnover"))
         if 5 <= turnover <= 15:
             score += 20
         elif 3 <= turnover <= 20:
             score += 10
 
-        amount = float(row.get("amount", 0) or 0)
+        amount = safe_float(row.get("amount"))
         if amount > 20e8:
             score += 25
         elif amount > 10e8:
@@ -142,15 +127,17 @@ class FiveDimScorer:
 
         if self.fund_flow is not None and not self.fund_flow.empty:
             try:
-                flow_row = self.fund_flow[self.fund_flow["代码"].astype(str) == code]
+                code_col = "代码" if "代码" in self.fund_flow.columns else "code"
+                flow_row = self.fund_flow[self.fund_flow[code_col].astype(str) == code]
                 if not flow_row.empty:
-                    net_inflow = float(flow_row.iloc[0].get("主力净流入-净额", 0) or 0)
+                    net_col = "main_net_inflow" if "main_net_inflow" in flow_row.columns else "主力净流入-净额"
+                    net_inflow = safe_float(flow_row.iloc[0].get(net_col))
                     if net_inflow > 0:
                         score += 15
                     if net_inflow > 1e8:
                         score += 10
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"资金流匹配失败 {code}: {e}")
         return min(100.0, score)
 
     # ============================================================
@@ -159,7 +146,7 @@ class FiveDimScorer:
     def _score_news_catalyst(self, row, code: str) -> float:
         score = 50.0
         industry = str(row.get("industry", ""))
-        if self.sector_flow is not None and not self.sector_flow.empty:
+        if self.sector_flow is not None and not self.sector_flow.empty and industry:
             try:
                 for col in self.sector_flow.columns:
                     if "名称" in col or "板块" in col:
@@ -171,9 +158,9 @@ class FiveDimScorer:
                         if not match.empty:
                             score += 20
                             break
-            except:
+            except Exception:
                 pass
-        ban_count = int(row.get("ban_count", 1) or 1)
+        ban_count = safe_int(row.get("ban_count"), 1)
         if ban_count >= 3:
             score += 25
         elif ban_count >= 2:
@@ -185,7 +172,7 @@ class FiveDimScorer:
     # ============================================================
     def _score_leader_status(self, row, hist: pd.DataFrame) -> float:
         score = 30.0
-        ban_count = int(row.get("ban_count", 1) or 1)
+        ban_count = safe_int(row.get("ban_count"), 1)
         if ban_count >= 4:
             score += 35
         elif ban_count >= 3:
@@ -195,13 +182,16 @@ class FiveDimScorer:
 
         if not hist.empty:
             recent_12m = hist.tail(250)
-            limit_ups = len(recent_12m[recent_12m["pct_chg"] >= 9.8])
+            # 自适应涨停阈值
+            max_pct = recent_12m["pct_chg"].astype(float).max()
+            threshold = 19.5 if max_pct > 15 else 9.5
+            limit_ups = len(recent_12m[recent_12m["pct_chg"].astype(float) >= threshold])
             density = limit_ups / max(len(recent_12m) / 20, 1)
             if density >= 2:
                 score += 20
             elif density >= 1:
                 score += 10
-        score += 15
+        score += 15  # 基础分（已通过铁律筛选）
         return min(100.0, score)
 
     # ============================================================
@@ -215,8 +205,9 @@ class FiveDimScorer:
         closes = hist["close"].astype(float).values
         volumes = hist["volume"].astype(float).values
 
+        # 量比
         if len(volumes) >= 6:
-            vol_ratio = volumes[-1] / np.mean(volumes[-6:-1])
+            vol_ratio = volumes[-1] / (np.mean(volumes[-6:-1]) + 1e-9)
             if 1.3 <= vol_ratio <= 3.0:
                 score += 25
             elif 3.0 < vol_ratio <= 5.0:
@@ -224,6 +215,7 @@ class FiveDimScorer:
             elif vol_ratio > 5.0:
                 score += 5
 
+        # 相对位置
         if len(closes) >= 60:
             high_60 = np.max(closes[-60:])
             low_60 = np.min(closes[-60:])
@@ -235,6 +227,7 @@ class FiveDimScorer:
             elif position > 0.85:
                 score += 5
 
+        # 均线多头排列
         if len(closes) >= 20:
             ma5 = np.mean(closes[-5:])
             ma10 = np.mean(closes[-10:])
@@ -246,9 +239,9 @@ class FiveDimScorer:
     # ============================================================
     # 买卖点位计算
     # ============================================================
-    def _calc_points(self, row, hist: pd.DataFrame) -> tuple:
-        close = float(row.get("close", 0) or 0)
-        ban_count = int(row.get("ban_count", 1) or 1)
+    def _calc_points(self, row, hist: pd.DataFrame) -> Tuple[str, str, str]:
+        close = safe_float(row.get("close"))
+        ban_count = safe_int(row.get("ban_count"), 1)
         if close <= 0:
             return ("—", "—", "—")
 

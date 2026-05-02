@@ -1,5 +1,5 @@
 """
-数据采集层 - 新浪数据源 + 磁盘缓存
+数据采集层 - 东方财富 + 新浪财经 + 磁盘缓存
 """
 import akshare as ak
 import pandas as pd
@@ -8,17 +8,22 @@ import time
 import random
 import os
 import hashlib
+import logging
 import warnings
+from typing import Dict, Optional
+
+from config import CFG
+from utils import safe_float
+
 warnings.filterwarnings("ignore")
+logger = logging.getLogger("data")
 
-CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
+CACHE_DIR = os.path.join(os.path.dirname(__file__), CFG.cache_dir)
 os.makedirs(CACHE_DIR, exist_ok=True)
-
-REQUEST_DELAY = 0.6
 
 
 def _throttle():
-    time.sleep(REQUEST_DELAY + random.uniform(0, 0.15))
+    time.sleep(CFG.request_delay + random.uniform(0, 0.15))
 
 
 def _cache_path(prefix: str, key: str, date_str: str) -> str:
@@ -26,7 +31,7 @@ def _cache_path(prefix: str, key: str, date_str: str) -> str:
     return os.path.join(CACHE_DIR, f"{prefix}_{date_str}_{h}.pkl")
 
 
-def _load_cache(path: str, max_age_hours: int = 12):
+def _load_cache(path: str, max_age_hours: int = 12) -> Optional[pd.DataFrame]:
     if not os.path.exists(path):
         return None
     if time.time() - os.path.getmtime(path) > max_age_hours * 3600:
@@ -40,16 +45,18 @@ def _load_cache(path: str, max_age_hours: int = 12):
 def _save_cache(path: str, df: pd.DataFrame):
     try:
         df.to_pickle(path)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"缓存写入失败: {e}")
 
 
 # ============================================================
-# 涨停池（东方财富，这个接口本身没问题）
+# 涨停池（东方财富）
 # ============================================================
 def get_limit_up_stocks(date_str: str) -> pd.DataFrame:
+    """获取当日涨停股池"""
     cache = _load_cache(_cache_path("zt", "pool", date_str), max_age_hours=24)
     if cache is not None:
+        logger.info(f"涨停池缓存命中: {len(cache)} 只")
         return cache
     try:
         df = ak.stock_zt_pool_em(date=date_str)
@@ -65,21 +72,21 @@ def get_limit_up_stocks(date_str: str) -> pd.DataFrame:
             "所属行业": "industry", "封板资金": "seal_money",
         }
         df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-        # 兼容：合并封板时间
         if "seal_time" not in df.columns:
             df["seal_time"] = df.get("first_seal_time", "")
         _save_cache(_cache_path("zt", "pool", date_str), df)
+        logger.info(f"涨停池获取成功: {len(df)} 只")
         return df
     except Exception as e:
-        print(f" ❌ {e}")
+        logger.error(f"涨停池获取失败: {e}")
         return pd.DataFrame()
 
 
 # ============================================================
-# 个股历史K线（新浪接口，从这台服务器可用）
+# 个股历史K线（新浪财经）
 # ============================================================
 def _code_to_sina(code: str) -> str:
-    """000553 -> sz000553, 600379 -> sh600379"""
+    """股票代码转新浪格式: 000553 -> sz000553"""
     if code.startswith(("0", "3")):
         return f"sz{code}"
     elif code.startswith(("6", "9")):
@@ -88,7 +95,7 @@ def _code_to_sina(code: str) -> str:
 
 
 def _fetch_one_history(code: str, days: int = 250) -> tuple:
-    """单只股票历史（新浪源）"""
+    """单只股票历史K线"""
     try:
         sina_code = _code_to_sina(code)
         end = datetime.now().strftime("%Y%m%d")
@@ -99,20 +106,18 @@ def _fetch_one_history(code: str, days: int = 250) -> tuple:
         )
         if df is None or df.empty:
             return (code, pd.DataFrame())
-        # 新浪返回的列: date, open, high, low, close, volume, amount, outstanding_share, turnover
-        # 统一列名（已经基本一致）
         df = df.sort_values("date").reset_index(drop=True)
-        # 确保有 pct_chg 列
         if "pct_chg" not in df.columns and len(df) > 1:
             df["pct_chg"] = df["close"].astype(float).pct_change() * 100
         return (code, df)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"历史数据获取失败 {code}: {e}")
         return (code, pd.DataFrame())
 
 
-def batch_get_history(codes: list, days: int = 250, date_str: str = "") -> dict:
-    """批量获取历史数据（串行+缓存）"""
-    result = {}
+def batch_get_history(codes: list, days: int = 250, date_str: str = "") -> Dict[str, pd.DataFrame]:
+    """批量获取历史数据（串行 + 缓存）"""
+    result: Dict[str, pd.DataFrame] = {}
     to_fetch = []
 
     for code in codes:
@@ -123,9 +128,10 @@ def batch_get_history(codes: list, days: int = 250, date_str: str = "") -> dict:
             to_fetch.append(code)
 
     if not to_fetch:
+        logger.info(f"历史数据全部缓存命中: {len(result)} 只")
         return result
 
-    print(f"  缓存命中 {len(result)}/{len(codes)}，需拉取 {len(to_fetch)} 只...")
+    logger.info(f"缓存命中 {len(result)}/{len(codes)}，需拉取 {len(to_fetch)} 只")
 
     done = 0
     for code in to_fetch:
@@ -137,6 +143,7 @@ def batch_get_history(codes: list, days: int = 250, date_str: str = "") -> dict:
             _save_cache(_cache_path("hist", code, date_str or "latest"), df)
 
     print()
+    logger.info(f"历史数据获取完成: {len(result)}/{len(codes)} 只")
     return result
 
 
@@ -152,19 +159,52 @@ def get_stock_history(code: str, days: int = 250) -> pd.DataFrame:
     return df
 
 
+# ============================================================
+# 板块资金流（东方财富）
+# ============================================================
 def get_sector_flow() -> pd.DataFrame:
+    """获取行业板块资金流排名"""
     cache = _load_cache(_cache_path("flow", "sector", "today"), max_age_hours=4)
     if cache is not None:
+        logger.info("板块资金流缓存命中")
         return cache
     try:
         df = ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="行业资金流")
         if df is not None and not df.empty:
             _save_cache(_cache_path("flow", "sector", "today"), df)
+            logger.info(f"板块资金流获取成功: {len(df)} 个板块")
             return df
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"板块资金流获取失败: {e}")
     return pd.DataFrame()
 
 
+# ============================================================
+# 个股资金流（东方财富）
+# ============================================================
 def get_individual_fund_flow() -> pd.DataFrame:
+    """获取个股主力资金流排名（实时）"""
+    cache = _load_cache(_cache_path("flow", "individual", "today"), max_age_hours=2)
+    if cache is not None:
+        logger.info("个股资金流缓存命中")
+        return cache
+    try:
+        df = ak.stock_individual_fund_flow_rank(indicator="今日")
+        if df is not None and not df.empty:
+            # 统一列名
+            col_map = {
+                "代码": "code", "名称": "name",
+                "主力净流入-净额": "main_net_inflow",
+                "主力净流入-净占比": "main_net_pct",
+                "超大单净流入-净额": "super_large_net",
+                "大单净流入-净额": "large_net",
+                "中单净流入-净额": "medium_net",
+                "小单净流入-净额": "small_net",
+            }
+            df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+            _save_cache(_cache_path("flow", "individual", "today"), df)
+            logger.info(f"个股资金流获取成功: {len(df)} 只")
+            return df
+    except Exception as e:
+        logger.warning(f"个股资金流获取失败（不影响核心筛选）: {e}")
     return pd.DataFrame()
