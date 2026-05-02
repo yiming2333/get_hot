@@ -23,11 +23,17 @@ class FiveDimScorer:
     def __init__(self, candidates: pd.DataFrame, date_str: str,
                  sector_flow: pd.DataFrame = None,
                  fund_flow: pd.DataFrame = None,
+                 dragon_tiger: pd.DataFrame = None,
+                 dragon_tiger_inst: pd.DataFrame = None,
+                 northbound: pd.DataFrame = None,
                  history_cache: dict = None):
         self.candidates = candidates
         self.date_str = date_str
         self.sector_flow = sector_flow
         self.fund_flow = fund_flow
+        self.dragon_tiger = dragon_tiger
+        self.dragon_tiger_inst = dragon_tiger_inst
+        self.northbound = northbound
         self._history_cache = history_cache or {}
 
     def _get_history(self, code: str) -> pd.DataFrame:
@@ -108,23 +114,24 @@ class FiveDimScorer:
     # D2: 主力资金共振（0-100）
     # ============================================================
     def _score_capital_resonance(self, row, code: str) -> float:
-        score = 40.0
+        score = 30.0  # 基础分降低，给新数据源腾空间
         turnover = safe_float(row.get("turnover"))
         if 5 <= turnover <= 15:
-            score += 20
-        elif 3 <= turnover <= 20:
             score += 10
+        elif 3 <= turnover <= 20:
+            score += 5
 
         amount = safe_float(row.get("amount"))
         if amount > 20e8:
-            score += 25
-        elif amount > 10e8:
-            score += 20
-        elif amount > 5e8:
-            score += 15
-        elif amount > 2e8:
             score += 10
+        elif amount > 10e8:
+            score += 8
+        elif amount > 5e8:
+            score += 5
+        elif amount > 2e8:
+            score += 3
 
+        # --- 个股资金流 ---
         if self.fund_flow is not None and not self.fund_flow.empty:
             try:
                 code_col = "代码" if "代码" in self.fund_flow.columns else "code"
@@ -133,18 +140,75 @@ class FiveDimScorer:
                     net_col = "main_net_inflow" if "main_net_inflow" in flow_row.columns else "主力净流入-净额"
                     net_inflow = safe_float(flow_row.iloc[0].get(net_col))
                     if net_inflow > 0:
-                        score += 15
+                        score += 8
                     if net_inflow > 1e8:
-                        score += 10
+                        score += 5
             except Exception as e:
                 logger.debug(f"资金流匹配失败 {code}: {e}")
+
+        # --- 龙虎榜：机构净买入 ---
+        if self.dragon_tiger_inst is not None and not self.dragon_tiger_inst.empty:
+            try:
+                lhb_row = self.dragon_tiger_inst[
+                    self.dragon_tiger_inst["code"].astype(str) == code
+                ]
+                if not lhb_row.empty:
+                    inst_net = safe_float(lhb_row.iloc[0].get("inst_net_buy"))
+                    buy_count = safe_int(lhb_row.iloc[0].get("buy_inst_count"))
+                    sell_count = safe_int(lhb_row.iloc[0].get("sell_inst_count"))
+                    if inst_net > 0:
+                        score += 10  # 机构净买入
+                    if inst_net > 5e8:
+                        score += 5   # 大额机构买入
+                    if buy_count > sell_count:
+                        score += 5   # 买方机构多于卖方
+                    logger.debug(f"{code} 龙虎榜机构: 净买={inst_net/1e8:.1f}亿 买方{buy_count}家")
+            except Exception as e:
+                logger.debug(f"龙虎榜机构匹配失败 {code}: {e}")
+
+        # --- 龙虎榜：游资席位净买入 ---
+        if self.dragon_tiger is not None and not self.dragon_tiger.empty:
+            try:
+                lhb_row = self.dragon_tiger[
+                    self.dragon_tiger["code"].astype(str) == code
+                ]
+                if not lhb_row.empty:
+                    lhb_net = safe_float(lhb_row.iloc[0].get("lhb_net_buy"))
+                    lhb_pct = safe_float(lhb_row.iloc[0].get("lhb_net_pct"))
+                    if lhb_net > 0:
+                        score += 5
+                    if lhb_pct > 5:
+                        score += 3  # 净买额占成交比>5%
+            except Exception as e:
+                logger.debug(f"龙虎榜匹配失败 {code}: {e}")
+
+        # --- 北向资金增持 ---
+        if self.northbound is not None and not self.northbound.empty:
+            try:
+                nb_row = self.northbound[
+                    self.northbound["code"].astype(str) == code
+                ]
+                if not nb_row.empty:
+                    hold_pct = safe_float(nb_row.iloc[0].get("nb_hold_circ_pct"))
+                    add_mv = safe_float(nb_row.iloc[0].get("nb_add_mv"))
+                    add_pct = safe_float(nb_row.iloc[0].get("nb_add_mv_pct"))
+                    if hold_pct > 3:
+                        score += 5   # 北向重仓股（>3%流通股）
+                    if hold_pct > 5:
+                        score += 3   # 北向高度控盘
+                    if add_mv > 0 and add_pct > 10:
+                        score += 5   # 北向大幅增持（市值增幅>10%）
+                    logger.debug(f"{code} 北向: 持仓{hold_pct}% 增持{add_pct}%")
+            except Exception as e:
+                logger.debug(f"北向资金匹配失败 {code}: {e}")
+
         return min(100.0, score)
 
     # ============================================================
     # D3: 全网消息催化（0-100）
     # ============================================================
     def _score_news_catalyst(self, row, code: str) -> float:
-        score = 50.0
+        score = 40.0  # 基础分降低，给龙虎榜解读腾空间
         industry = str(row.get("industry", ""))
         if self.sector_flow is not None and not self.sector_flow.empty and industry:
             try:
@@ -156,16 +220,61 @@ class FiveDimScorer:
                             )
                         ]
                         if not match.empty:
-                            score += 20
+                            score += 15
                             break
             except Exception:
                 pass
         ban_count = safe_int(row.get("ban_count"), 1)
         if ban_count >= 3:
-            score += 25
-        elif ban_count >= 2:
             score += 15
-        return min(100.0, score)
+        elif ban_count >= 2:
+            score += 8
+
+        # --- 龙虎榜解读（人工/机构评价） ---
+        if self.dragon_tiger is not None and not self.dragon_tiger.empty:
+            try:
+                lhb_row = self.dragon_tiger[
+                    self.dragon_tiger["code"].astype(str) == code
+                ]
+                if not lhb_row.empty:
+                    comment = str(lhb_row.iloc[0].get("lhb_comment", ""))
+                    reason = str(lhb_row.iloc[0].get("lhb_reason", ""))
+                    # 机构买入信号
+                    if "机构" in comment and "买入" in comment:
+                        score += 15
+                    elif "机构" in comment and "卖出" in comment:
+                        score -= 5
+                    # 知名游资
+                    if any(kw in comment for kw in ["知名游资", "章盟主", "赵老哥", "作手新一", "溧阳路"]):
+                        score += 10
+                    # 涨停上榜（正面催化）
+                    if "涨幅" in reason or "涨停" in reason:
+                        score += 8
+                    # 跌停/跌幅上榜（负面催化）
+                    if "跌幅" in reason or "跌停" in reason:
+                        score -= 10
+                    logger.debug(f"{code} 龙虎榜: {comment[:30]}")
+            except Exception as e:
+                logger.debug(f"龙虎榜解读匹配失败 {code}: {e}")
+
+        # --- 北向资金动向（外资风向标） ---
+        if self.northbound is not None and not self.northbound.empty:
+            try:
+                nb_row = self.northbound[
+                    self.northbound["code"].astype(str) == code
+                ]
+                if not nb_row.empty:
+                    add_pct = safe_float(nb_row.iloc[0].get("nb_add_mv_pct"))
+                    if add_pct > 20:
+                        score += 10  # 外资大幅加仓，强信号
+                    elif add_pct > 10:
+                        score += 5
+                    elif add_pct < -10:
+                        score -= 5  # 外资减仓
+            except Exception:
+                pass
+
+        return min(100.0, max(0.0, score))
 
     # ============================================================
     # D4: 龙头地位确认（0-100）

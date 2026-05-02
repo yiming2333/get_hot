@@ -14,7 +14,9 @@ from datetime import datetime
 from config import CFG, LOG_LEVEL, LOG_FORMAT
 from data_fetcher import (
     get_limit_up_stocks, get_sector_flow,
-    get_individual_fund_flow, batch_get_history
+    get_individual_fund_flow, batch_get_history,
+    get_dragon_tiger_list, get_dragon_tiger_institution,
+    get_northbound_flow
 )
 from filters import IronFilter
 from scorer import FiveDimScorer
@@ -74,12 +76,27 @@ def run_screen(date_str: str):
     else:
         print(" ⚠️ 跳过（不影响核心筛选）")
 
-    print("  [3/3] 获取个股资金流...", end="", flush=True)
+    print("  [3/5] 获取个股资金流...", end="", flush=True)
     fund_flow = get_individual_fund_flow()
     if fund_flow is not None and not fund_flow.empty:
         print(f" ✅ {len(fund_flow)}只个股")
     else:
-        print(" ⚠️ 跳过（不影响核心筛选）")
+        print(" ⚠️ 跳过")
+
+    print("  [4/5] 获取龙虎榜...", end="", flush=True)
+    dragon_tiger = get_dragon_tiger_list(date_str)
+    dragon_tiger_inst = get_dragon_tiger_institution(date_str)
+    if dragon_tiger is not None and not dragon_tiger.empty:
+        print(f" ✅ {len(dragon_tiger)}条上榜记录")
+    else:
+        print(" ⚠️ 跳过（当日无龙虎榜数据）")
+
+    print("  [5/5] 获取北向资金...", end="", flush=True)
+    northbound = get_northbound_flow()
+    if northbound is not None and not northbound.empty:
+        print(f" ✅ {len(northbound)}只北向持股")
+    else:
+        print(" ⚠️ 跳过")
 
     # 涨停池概览
     print(f"\n📋 当日涨停池概览:")
@@ -121,6 +138,9 @@ def run_screen(date_str: str):
         candidates, date_str,
         sector_flow=sector_flow,
         fund_flow=fund_flow,
+        dragon_tiger=dragon_tiger,
+        dragon_tiger_inst=dragon_tiger_inst,
+        northbound=northbound,
         history_cache=history_cache
     )
     results = scorer.score_all()
